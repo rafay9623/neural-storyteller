@@ -1,6 +1,7 @@
 import streamlit as st
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pickle
 import os
 import time
@@ -143,43 +144,77 @@ def load_all_resources():
         return None
 
 # ============================================================================
-# INFERENCE FUNCTION
+# INFERENCE FUNCTIONS
 # ============================================================================
 
-def generate_caption(model, features, vocab, max_len=50, device='cuda'):
-    """Generate caption from image features"""
+def generate_caption_beam(
+    model,
+    features,
+    vocab,
+    max_len: int = 50,
+    device: str = "cuda",
+    beam_size: int = 3,
+    length_penalty: float = 0.7,
+):
+    """
+    Generate caption using beam search instead of greedy decoding.
+    This typically improves caption quality over simple argmax sampling.
+    """
     model.eval()
     with torch.no_grad():
-        # `features` is already shaped as (batch=1, 2048) before this call.
-        # Just move it to the target device without adding an extra dimension,
-        # otherwise BatchNorm will see a channel size of 1 and fail.
+        # `features` has shape (1, 2048)
         features = features.to(device)
-        h = model.encoder(features).unsqueeze(0)
-        c = torch.zeros(1, 1, 512).to(device)
-        
-        # Start token
+        h0 = model.encoder(features).unsqueeze(0)          # (1, 1, 512)
+        c0 = torch.zeros(1, 1, 512, device=device)
+
         start_id = vocab.stoi["<START>"]
-        token = torch.LongTensor([[start_id]]).to(device)
-        caption = [start_id]
-        
+        end_id = vocab.stoi["<END>"]
+
+        # Each beam is (log_prob, token_ids, h, c)
+        beams = [(0.0, [start_id], h0, c0)]
+
         for _ in range(max_len - 1):
-            embedded = model.decoder.embedding(token)
-            embedded = model.decoder.dropout(embedded)
-            lstm_out, (h, c) = model.decoder.lstm(embedded, (h, c))
-            logits = model.decoder.fc(lstm_out[:, 0, :])
-            next_id = logits.argmax(dim=1).item()
-            caption.append(next_id)
-            
-            if next_id == vocab.stoi["<END>"]:
-                break
-            
-            token = torch.LongTensor([[next_id]]).to(device)
-    
+            new_beams = []
+            for log_p, seq, h, c in beams:
+                # If already ended, just keep the beam
+                if seq[-1] == end_id:
+                    new_beams.append((log_p, seq, h, c))
+                    continue
+
+                token = torch.LongTensor([[seq[-1]]]).to(device)
+                embedded = model.decoder.embedding(token)
+                embedded = model.decoder.dropout(embedded)
+                lstm_out, (h_new, c_new) = model.decoder.lstm(embedded, (h, c))
+                logits = model.decoder.fc(lstm_out[:, 0, :])
+
+                log_probs = F.log_softmax(logits, dim=-1).squeeze(0)
+                top_log_probs, top_indices = torch.topk(log_probs, beam_size)
+
+                for k in range(beam_size):
+                    token_id = top_indices[k].item()
+                    score = log_p + top_log_probs[k].item()
+                    new_seq = seq + [token_id]
+                    new_beams.append((score, new_seq, h_new, c_new))
+
+            # Length-normalized scoring for more balanced beams
+            beams = sorted(
+                new_beams,
+                key=lambda x: x[0] / (len(x[1]) ** length_penalty),
+                reverse=True,
+            )[:beam_size]
+
+        # Take the best beam
+        best_log_p, best_seq, _, _ = beams[0]
+
     # Filter out special tokens
-    ignore_tokens = {vocab.stoi["<START>"], vocab.stoi["<PAD>"], vocab.stoi["<END>"]}
-    words = [vocab.itos[i] for i in caption if i not in ignore_tokens]
-    
-    return ' '.join(words) if words else "A scene captured by the model."
+    ignore_tokens = {
+        vocab.stoi["<START>"],
+        vocab.stoi["<PAD>"],
+        vocab.stoi["<END>"],
+    }
+    words = [vocab.itos[i] for i in best_seq if i not in ignore_tokens]
+
+    return " ".join(words) if words else "A scene captured by the model."
 
 # ============================================================================
 # STREAMLIT UI
@@ -227,9 +262,17 @@ with col2:
                         # Output shape from resnet is (1, 2048, 1, 1) -> flatten to (1, 2048)
                         features = resnet(img_tensor).view(1, -1)
                     
-                    # 3. Generate Caption
+                    # 3. Generate Caption (beam search for better quality)
                     start_time = time.time()
-                    caption = generate_caption(model, features, vocab, max_len=max_length, device=device)
+                    caption = generate_caption_beam(
+                        model,
+                        features,
+                        vocab,
+                        max_len=max_length,
+                        device=device,
+                        beam_size=3,
+                        length_penalty=0.7,
+                    )
                     duration = time.time() - start_time
                     
                     st.success(f"Processing complete in {duration:.2f}s")
