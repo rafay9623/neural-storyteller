@@ -222,17 +222,25 @@ def generate_caption_beam(
     return " ".join(words) if words else "A scene captured by the model."
 
 
+# ImageNet dog breeds: don't replace "dog" with a breed name (e.g. kuvasz) so we keep simpler "dog"
+_IMAGENET_DOG_BREEDS = {
+    "affenpinscher", "kuvasz", "golden retriever", "labrador retriever", "corgi",
+    "beagle", "poodle", "bulldog", "chihuahua", "german shepherd", "dalmatian",
+    "husky", "malamute", "terrier", "boxer", "pug", "rottweiler", "doberman",
+    "mastiff", "schnauzer", "shih tzu", "samoyed", "collie", "shepherd", "retriever",
+}
+
+
 def correct_caption_with_imagenet(caption: str, imagenet_label: str) -> str:
     """
-    When the caption mentions a different object than ImageNet's top prediction
-    (e.g. "dog" vs "goldfish"), replace the wrong subject with the ImageNet label
-    so the description matches the image.
+    When the caption mentions a different *type* of object than ImageNet (e.g. dog vs goldfish),
+    replace the wrong subject with the ImageNet label. Skip when both are same category
+    (e.g. "dog" vs "kuvasz") so we keep the simpler word.
     """
     if not caption or not imagenet_label or len(imagenet_label) < 2:
         return caption
     label_lower = imagenet_label.lower()
     caption_lower = caption.lower()
-    # Words the caption model often gets wrong when ImageNet disagrees
     wrong_subjects = [
         "dog", "dogs", "cat", "cats", "bird", "birds", "horse", "horses",
         "cow", "cows", "sheep", "car", "cars", "person", "people", "man", "woman",
@@ -240,6 +248,12 @@ def correct_caption_with_imagenet(caption: str, imagenet_label: str) -> str:
     ]
     for w in wrong_subjects:
         if w not in caption_lower or label_lower in w or w in label_lower:
+            continue
+        # Don't replace "dog" with a dog breed (e.g. kuvasz) — keep "dog"
+        if w in ("dog", "dogs") and label_lower in _IMAGENET_DOG_BREEDS:
+            continue
+        # Same for cat breeds if we had them
+        if w in ("cat", "cats") and any(x in label_lower for x in ("tabby", "persian", "siamese", "egyptian", "tiger cat")):
             continue
         pattern = r"\b" + re.escape(w) + r"\b"
         match = re.search(pattern, caption, re.IGNORECASE)
