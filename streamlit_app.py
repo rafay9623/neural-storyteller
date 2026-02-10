@@ -8,6 +8,22 @@ from PIL import Image
 import numpy as np
 from torchvision import models, transforms
 
+
+class Vocabulary:
+    """
+    Minimal Vocabulary class used only for loading the pickled vocab.
+    The original training script pickled an instance of this class, so we
+    recreate it here with the attributes the app expects: `stoi`, `itos`
+    and a working `__len__`.
+    """
+    def __init__(self):
+        self.stoi = {}
+        self.itos = []
+
+    def __len__(self):
+        return len(self.itos)
+
+
 # ============================================================================
 # MODEL ARCHITECTURE
 # ============================================================================
