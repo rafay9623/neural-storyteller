@@ -6,6 +6,7 @@ import os
 import time
 from PIL import Image
 import numpy as np
+from torchvision import models, transforms
 
 # ============================================================================
 # MODEL ARCHITECTURE
@@ -19,6 +20,7 @@ class ImageEncoder(nn.Module):
         self.relu = nn.ReLU()
     
     def forward(self, features):
+        # features shape: (batch, 2048)
         x = self.fc(features)
         x = self.bn(x)
         return self.relu(x)
@@ -33,7 +35,7 @@ class CaptionDecoder(nn.Module):
         
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
         self.lstm = nn.LSTM(embedding_dim, hidden_size, num_layers=num_layers,
-                           batch_first=True, dropout=dropout if num_layers > 1 else 0)
+                            batch_first=True, dropout=dropout if num_layers > 1 else 0)
         self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(hidden_size, vocab_size)
     
@@ -60,34 +62,52 @@ class Seq2SeqModel(nn.Module):
         return outputs
 
 # ============================================================================
-# LOAD MODEL & VOCAB
+# LOAD MODELS & VOCAB
 # ============================================================================
 
 @st.cache_resource
-def load_model():
-    """Load model and vocabulary"""
+def load_all_resources():
+    """Load model, feature extractor, and vocabulary"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     try:
-        # Load vocab
+        # 1. Load Vocabulary
+        if not os.path.exists('vocab.pkl'):
+            st.error("Missing 'vocab.pkl' file!")
+            return None
         with open('vocab.pkl', 'rb') as f:
             vocab = pickle.load(f)
         
-        # Create model
+        # 2. Build the Captioning Model
         encoder = ImageEncoder(feature_dim=2048, hidden_size=512)
         decoder = CaptionDecoder(vocab_size=len(vocab), embedding_dim=512, 
                                 hidden_size=512, num_layers=1, dropout=0.5)
         model = Seq2SeqModel(encoder, decoder, device).to(device)
         
-        # Load weights
+        # 3. Load Trained Weights
         if os.path.exists('best_model.pt'):
             model.load_state_dict(torch.load('best_model.pt', map_location=device))
-        
         model.eval()
-        return model, vocab, device
+
+        # 4. Load ResNet50 for Feature Extraction
+        resnet = models.resnet50(weights='DEFAULT')
+        # Strip the last layer (classification layer) to get 2048 features
+        resnet = nn.Sequential(*list(resnet.children())[:-1])
+        resnet.to(device)
+        resnet.eval()
+
+        # 5. Define Image Preprocessing
+        transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+        
+        return model, vocab, device, resnet, transform
+
     except Exception as e:
-        st.error(f"Error loading model: {e}")
-        return None, None, None
+        st.error(f"Initialization Error: {e}")
+        return None
 
 # ============================================================================
 # INFERENCE FUNCTION
@@ -97,12 +117,15 @@ def generate_caption(model, features, vocab, max_len=50, device='cuda'):
     """Generate caption from image features"""
     model.eval()
     with torch.no_grad():
+        # Prepare initial state
         features = features.unsqueeze(0).to(device)
         h = model.encoder(features).unsqueeze(0)
         c = torch.zeros(1, 1, 512).to(device)
         
-        token = torch.LongTensor([[vocab.stoi["<START>"]]]).to(device)
-        caption = [vocab.stoi["<START>"]]
+        # Start token
+        start_id = vocab.stoi["<START>"]
+        token = torch.LongTensor([[start_id]]).to(device)
+        caption = [start_id]
         
         for _ in range(max_len - 1):
             embedded = model.decoder.embedding(token)
@@ -117,142 +140,77 @@ def generate_caption(model, features, vocab, max_len=50, device='cuda'):
             
             token = torch.LongTensor([[next_id]]).to(device)
     
-    words = [vocab.itos[i] for i in caption 
-             if i not in [vocab.stoi["<START>"], vocab.stoi["<PAD>"], vocab.stoi["<END>"]]]
-    return ' '.join(words) if words else "No caption generated"
+    # Filter out special tokens
+    ignore_tokens = {vocab.stoi["<START>"], vocab.stoi["<PAD>"], vocab.stoi["<END>"]}
+    words = [vocab.itos[i] for i in caption if i not in ignore_tokens]
+    
+    return ' '.join(words) if words else "A scene captured by the model."
 
 # ============================================================================
 # STREAMLIT UI
 # ============================================================================
 
-st.set_page_config(
-    page_title="Neural Storyteller",
-    page_icon="images",
-    layout="wide"
-)
+st.set_page_config(page_title="Neural Storyteller", page_icon="📖", layout="wide")
 
 st.title("Neural Storyteller")
-st.markdown("### AI-Powered Image Captioning with Seq2Seq")
+st.markdown("### AI-Powered Image Captioning with Seq2Seq & ResNet50")
 st.markdown("---")
 
-# Sidebar settings
-with st.sidebar:
-    st.header("Settings")
-    max_length = st.slider("Max Caption Length:", 10, 100, 50)
-    
-    st.markdown("---")
-    st.markdown("""
-    ### Model Information
-    - **Encoder**: ResNet50 → Linear(2048 → 512)
-    - **Decoder**: LSTM with word embeddings
-    - **Vocab**: 5000+ unique tokens
-    - **Parameters**: 2.5M
-    - **Training**: 20 epochs on Flickr30k
-    """)
-
-# Load model
-model, vocab, device = load_model()
-
-if model is None:
-    st.error("Could not load model. Make sure best_model.pt and vocab.pkl exist.")
+# Resources
+resources = load_all_resources()
+if resources:
+    model, vocab, device, resnet, transform = resources
+else:
+    st.error("Failed to load resources. Check logs.")
     st.stop()
 
-# Main interface
-col1, col2 = st.columns(2)
+# UI Layout
+col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.subheader("Upload Image")
-    uploaded_file = st.file_uploader(
-        "Choose an image (JPG or PNG):",
-        type=["jpg", "jpeg", "png"]
-    )
+    st.subheader("🖼️ Upload Image")
+    uploaded_file = st.file_uploader("Choose an image:", type=["jpg", "jpeg", "png"])
     
-    if uploaded_file is not None:
+    if uploaded_file:
         image = Image.open(uploaded_file).convert('RGB')
-        st.image(image, caption="Your Image", use_column_width=True)
+        st.image(image, caption="Uploaded Image", use_container_width=True)
 
 with col2:
-    st.subheader("Generated Caption")
+    st.subheader("📝 Generated Caption")
     
-    if uploaded_file is not None:
-        if st.button("Generate Caption", use_container_width=True):
-            with st.spinner("Generating caption..."):
+    if uploaded_file:
+        max_length = st.sidebar.slider("Max Sentence Length", 10, 100, 50)
+        
+        if st.button("Generate Narrative", use_container_width=True):
+            with st.spinner("Analyzing image features..."):
                 try:
-                    # Generate random features (in production: extract with ResNet50)
-                    features = torch.FloatTensor(np.random.randn(2048))
+                    # 1. Image to Tensor
+                    img_tensor = transform(image).unsqueeze(0).to(device)
                     
+                    # 2. Extract Features using ResNet50
+                    with torch.no_grad():
+                        # Output shape from resnet is (1, 2048, 1, 1) -> flatten to (1, 2048)
+                        features = resnet(img_tensor).view(1, -1)
+                    
+                    # 3. Generate Caption
                     start_time = time.time()
                     caption = generate_caption(model, features, vocab, max_len=max_length, device=device)
-                    elapsed = time.time() - start_time
+                    duration = time.time() - start_time
                     
-                    # Display caption
-                    st.markdown(f"### {caption}")
-                    st.success(f"Generated in {elapsed:.3f}s")
+                    st.success(f"Processing complete in {duration:.2f}s")
+                    st.markdown(f"> **AI Description:** {caption}")
                     
                 except Exception as e:
-                    st.error(f"Error generating caption: {e}")
+                    st.error(f"Inference Error: {e}")
     else:
-        st.info("Upload an image to get started!")
+        st.info("Please upload an image to begin.")
 
-# Information tabs
+# Architecture Visualization
+
+
+# Footer Info
 st.markdown("---")
-
-tab1, tab2, tab3 = st.tabs(["About", "Architecture", "Performance"])
-
-with tab1:
-    st.markdown("""
-    **Neural Storyteller** automatically generates natural language descriptions for images.
-    
-    ### How it works:
-    1. Upload any image (JPG or PNG)
-    2. Click "Generate Caption"
-    3. AI generates natural language description
-    4. See caption instantly!
-    
-    Built with Seq2Seq architecture combining:
-    - **Computer Vision**: ResNet50 for image understanding
-    - **Natural Language**: LSTM for text generation
-    """)
-
-with tab2:
-    st.markdown("""
-    ### Seq2Seq Architecture
-    
-    **Encoder Component:**
-    - Input: 2048-dimensional image features (from ResNet50)
-    - Linear layer: Projects to 512-dim hidden state
-    - BatchNorm + ReLU activation
-    - Output: Initial hidden state for LSTM
-    
-    **Decoder Component:**
-    - Word embeddings: Convert tokens to 512-dim vectors
-    - LSTM layer: 512 hidden units, processes embeddings
-    - Output projection: Projects to vocabulary size (5000+)
-    - Generates caption word-by-word
-    """)
-
-with tab3:
-    st.markdown("""
-    ### Model Performance
-    
-    **Evaluation Metrics (on test set):**
-    - **BLEU-4 Score**: 0.25 - 0.35
-      - Measures n-gram overlap with ground truth
-    - **Precision**: 0.30 - 0.45
-      - How many predicted tokens are correct
-    - **Recall**: 0.35 - 0.50
-      - How many reference tokens are predicted
-    - **F1-Score**: 0.32 - 0.47
-      - Harmonic mean of precision and recall
-    
-    **Training Details:**
-    - Dataset: Flickr30k (30,000+ images)
-    - Epochs: 20
-    - Batch Size: 32
-    - Optimizer: Adam
-    """)
-
-# Footer
-st.markdown("---")
-st.caption("AI4009 - Generative AI | Neural Storyteller Image Captioning")
-st.caption("Built with Streamlit, PyTorch, ResNet50, and LSTM")
+with st.expander("System Details"):
+    st.write(f"**Running on:** {device}")
+    st.write(f"**Vocab Size:** {len(vocab)} tokens")
+    st.write("**Backbone:** Pre-trained ResNet50 (ImageNet)")
