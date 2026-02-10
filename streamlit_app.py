@@ -64,7 +64,14 @@ class Seq2SeqModel(nn.Module):
 # ============================================================================
 # LOAD MODELS & VOCAB
 # ============================================================================
+class Vocabulary:
+    def __init__(self):
+        self.itos = {0: "<PAD>", 1: "<START>", 2: "<END>", 3: "<UNK>"}
+        self.stoi = {v: k for k, v in self.itos.items()}
+        self.idx = 4
 
+    def __len__(self):
+        return len(self.itos)
 @st.cache_resource
 def load_all_resources():
     """Load model, feature extractor, and vocabulary"""
