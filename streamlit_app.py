@@ -150,8 +150,10 @@ def generate_caption(model, features, vocab, max_len=50, device='cuda'):
     """Generate caption from image features"""
     model.eval()
     with torch.no_grad():
-        # Prepare initial state
-        features = features.unsqueeze(0).to(device)
+        # `features` is already shaped as (batch=1, 2048) before this call.
+        # Just move it to the target device without adding an extra dimension,
+        # otherwise BatchNorm will see a channel size of 1 and fail.
+        features = features.to(device)
         h = model.encoder(features).unsqueeze(0)
         c = torch.zeros(1, 1, 512).to(device)
         
