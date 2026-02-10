@@ -17,11 +17,30 @@ class Vocabulary:
     and a working `__len__`.
     """
     def __init__(self):
+        # These will be populated from the pickle; defaults are placeholders.
         self.stoi = {}
         self.itos = []
 
     def __len__(self):
         return len(self.itos)
+
+
+class VocabUnpickler(pickle.Unpickler):
+    """
+    Custom unpickler that maps any pickled `Vocabulary` reference
+    to the local `Vocabulary` class defined above, regardless of
+    which module name was used when it was originally pickled.
+    """
+    def find_class(self, module, name):
+        if name == "Vocabulary":
+            return Vocabulary
+        return super().find_class(module, name)
+
+
+def load_vocab(path: str) -> Vocabulary:
+    """Load the vocabulary using the custom unpickler."""
+    with open(path, "rb") as f:
+        return VocabUnpickler(f).load()
 
 
 # ============================================================================
@@ -80,14 +99,6 @@ class Seq2SeqModel(nn.Module):
 # ============================================================================
 # LOAD MODELS & VOCAB
 # ============================================================================
-class Vocabulary:
-    def __init__(self):
-        self.itos = {0: "<PAD>", 1: "<START>", 2: "<END>", 3: "<UNK>"}
-        self.stoi = {v: k for k, v in self.itos.items()}
-        self.idx = 4
-
-    def __len__(self):
-        return len(self.itos)
 @st.cache_resource
 def load_all_resources():
     """Load model, feature extractor, and vocabulary"""
@@ -98,8 +109,7 @@ def load_all_resources():
         if not os.path.exists('vocab.pkl'):
             st.error("Missing 'vocab.pkl' file!")
             return None
-        with open('vocab.pkl', 'rb') as f:
-            vocab = pickle.load(f)
+        vocab = load_vocab('vocab.pkl')
         
         # 2. Build the Captioning Model
         encoder = ImageEncoder(feature_dim=2048, hidden_size=512)
